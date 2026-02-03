@@ -13,9 +13,16 @@ import {
   View,
 } from 'react-native';
 
-const ASSEMBLYAI_API_KEY = Constants.expoConfig?.extra?.assemblyaiApiKey ?? '';
-const GENIUS_ACCESS_TOKEN = Constants.expoConfig?.extra?.geniusAccessToken ?? '';
-const AUDD_API_TOKEN = Constants.expoConfig?.extra?.auddApiToken ?? '';
+const appExtra =
+  (Constants.expoConfig?.extra as Record<string, string> | undefined) ??
+  // Fallbacks for different Expo runtime manifests
+  ((Constants as { manifest?: { extra?: Record<string, string> } }).manifest?.extra) ??
+  ((Constants as { manifest2?: { extra?: Record<string, string> } }).manifest2?.extra) ??
+  {};
+
+const ASSEMBLYAI_API_KEY = appExtra.assemblyaiApiKey ?? '';
+const GENIUS_ACCESS_TOKEN = appExtra.geniusAccessToken ?? '';
+const AUDD_API_TOKEN = appExtra.auddApiToken ?? '';
 
 const LANGUAGE_OPTIONS = [
   { label: 'Vietnamese', value: 'vi' },
@@ -32,6 +39,7 @@ type SongResult = {
   fullTitle: string;
   songUrl: string;
   imageUrl?: string;
+  previewUrl?: string;
   source: 'audd' | 'genius';
 };
 
@@ -60,13 +68,21 @@ export default function App() {
   const [language, setLanguage] = useState(LANGUAGE_OPTIONS[0].value);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [vuLevel, setVuLevel] = useState(0);
+  const [chunkCount, setChunkCount] = useState(0);
   const [candidates, setCandidates] = useState<
-    Array<{ id: string; title: string; artist: string; score: number; source: string }>
+    Array<{ id: string; title: string; artist: string; score: number; source: string; result: SongResult }>
   >([]);
+  const [bestScore, setBestScore] = useState(0);
+  const bestScoreRef = useRef(0);
+  const [previewSound, setPreviewSound] = useState<Audio.Sound | null>(null);
+  const [isPreviewPlaying, setIsPreviewPlaying] = useState(false);
+  const previewSoundRef = useRef<Audio.Sound | null>(null);
 
-  const chunkTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const chunkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeSessionRef = useRef(0);
   const isStoppingRef = useRef(false);
+  const recordingRef = useRef<Audio.Recording | null>(null);
+  const chunkIndexRef = useRef(0);
 
   const hasKeys = useMemo(() => {
     return ASSEMBLYAI_API_KEY.trim().length > 10 &&
@@ -75,13 +91,22 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    previewSoundRef.current = previewSound;
+  }, [previewSound]);
+
+  useEffect(() => {
     return () => {
-      if (recording) {
-        recording.stopAndUnloadAsync().catch(() => {});
+      if (recordingRef.current) {
+        recordingRef.current.stopAndUnloadAsync().catch(() => {});
+        recordingRef.current = null;
+      }
+      if (previewSoundRef.current) {
+        previewSoundRef.current.unloadAsync().catch(() => {});
+        previewSoundRef.current = null;
       }
       clearChunkTimer();
     };
-  }, [recording]);
+  }, []);
 
   const normalizeLyrics = (text: string) => {
     const noPunctuation = text
@@ -114,9 +139,14 @@ export default function App() {
     setErrorMessage('');
     setStatusMessage('');
     setSongResult(null);
+    setBestScore(0);
+    bestScoreRef.current = 0;
     setTranscriptText('');
     setCleanedText('');
     setCandidates([]);
+    setChunkCount(0);
+    chunkIndexRef.current = 0;
+    stopPreview().catch(() => {});
 
     if (!hasKeys) {
       Alert.alert('Missing API keys', 'Please add AssemblyAI, Genius, and AudD keys in App.tsx.');
@@ -145,17 +175,21 @@ export default function App() {
   };
 
   const stopRecording = async () => {
-    if (!recording || isStoppingRef.current) {
+    const currentRecording = recordingRef.current;
+    if (!currentRecording || isStoppingRef.current) {
       return;
     }
 
     isStoppingRef.current = true;
+    activeSessionRef.current += 1;
     setIsRecording(false);
+    setVuLevel(0);
     clearChunkTimer();
 
     try {
-      const stoppedRecording = recording;
+      const stoppedRecording = currentRecording;
       setRecording(null);
+      recordingRef.current = null;
       await stoppedRecording.stopAndUnloadAsync();
       const uri = stoppedRecording.getURI();
 
@@ -174,7 +208,7 @@ export default function App() {
 
   const clearChunkTimer = () => {
     if (chunkTimerRef.current) {
-      clearInterval(chunkTimerRef.current);
+      clearTimeout(chunkTimerRef.current);
       chunkTimerRef.current = null;
     }
   };
@@ -196,22 +230,23 @@ export default function App() {
       );
       setVuLevel(normalized);
     });
+    newRecording.setProgressUpdateInterval(200);
 
     await newRecording.startAsync();
     setRecording(newRecording);
+    recordingRef.current = newRecording;
 
     clearChunkTimer();
-    chunkTimerRef.current = setInterval(async () => {
+    chunkTimerRef.current = setTimeout(async () => {
       if (isStoppingRef.current || !newRecording) {
         return;
       }
+      let uri: string | null = null;
       try {
         await newRecording.stopAndUnloadAsync();
-        const uri = newRecording.getURI();
-        if (uri && sessionId === activeSessionRef.current) {
-          await transcribeAndSearch(uri, true);
-        }
+        uri = newRecording.getURI();
       } catch {
+        setErrorMessage('Không thể dừng đoạn ghi âm.');
         return;
       }
 
@@ -219,22 +254,34 @@ export default function App() {
         return;
       }
 
-      await startChunk(sessionId);
+      void startChunk(sessionId);
+
+      if (uri) {
+        const nextIndex = chunkIndexRef.current + 1;
+        chunkIndexRef.current = nextIndex;
+        setChunkCount(nextIndex);
+        void transcribeAndSearch(uri, true, nextIndex);
+      }
     }, CHUNK_MS);
   };
 
-  const transcribeAndSearch = async (uri: string, isChunk = false) => {
+  const transcribeAndSearch = async (uri: string, isChunk = false, chunkIndex?: number) => {
     if (!isChunk) {
       setIsTranscribing(true);
     }
     setErrorMessage('');
-    setStatusMessage('Đang nhận diện nhạc bằng AudD...');
+    const indexLabel = chunkIndex ?? chunkIndexRef.current + 1;
+    setStatusMessage(isChunk ? `Đang nhận diện nhạc (đoạn ${indexLabel})...` : 'Đang nhận diện nhạc bằng AudD...');
 
     try {
       const audioResult = await identifySongByAudio(uri);
       if (audioResult) {
         setSongResult(audioResult);
         updateCandidates(audioResult, 0.92);
+      }
+
+      if (isChunk) {
+        return;
       }
 
       setStatusMessage('Đang chuyển giọng nói thành văn bản...');
@@ -280,7 +327,8 @@ export default function App() {
         ]);
       }
     } catch (error) {
-      setErrorMessage('Processing failed. Please try again.');
+      const message = error instanceof Error ? error.message : 'Processing failed. Please try again.';
+      setErrorMessage(message);
     } finally {
       if (!isChunk) {
         setIsTranscribing(false);
@@ -302,7 +350,8 @@ export default function App() {
     });
 
     if (!response.ok) {
-      throw new Error('Upload failed');
+      const errorText = await response.text();
+      throw new Error(`Upload failed (${response.status}): ${errorText}`);
     }
 
     const data = await response.json();
@@ -376,6 +425,11 @@ export default function App() {
       return null;
     }
 
+    const previewUrl =
+      data.result?.spotify?.preview_url ??
+      data.result?.apple_music?.previews?.[0]?.url ??
+      undefined;
+
     return {
       id: Number(data.result?.song_id ?? Date.now()),
       title: data.result?.title ?? 'Unknown title',
@@ -383,6 +437,7 @@ export default function App() {
       fullTitle: `${data.result?.artist ?? 'Unknown'} - ${data.result?.title ?? 'Unknown'}`,
       songUrl: data.result?.song_link ?? '',
       imageUrl: data.result?.spotify?.album?.images?.[0]?.url,
+      previewUrl,
       source: 'audd',
     };
   };
@@ -397,9 +452,10 @@ export default function App() {
     setCandidates((prev) => {
       const key = `${result.title}-${result.artist}`;
       const existing = prev.find((item) => item.id === key);
-      const nextScore = existing ? Math.max(existing.score, score) : score;
+      const baseScore = Math.max(existing?.score ?? 0, score);
+      const nextScore = existing ? Math.min(0.98, baseScore + 0.03) : baseScore;
       const next = [
-        { id: key, title: result.title, artist: result.artist, score: nextScore, source: result.source },
+        { id: key, title: result.title, artist: result.artist, score: nextScore, source: result.source, result },
         ...prev.filter((item) => item.id !== key),
       ]
         .sort((a, b) => b.score - a.score)
@@ -407,6 +463,12 @@ export default function App() {
 
       if (next[0] && next[0].score >= 0.9) {
         setStatusMessage(`Đã có kết quả tự tin: ${next[0].title}`);
+      }
+
+      if (next[0] && next[0].score > bestScoreRef.current + 0.05) {
+        setSongResult(next[0].result);
+        setBestScore(next[0].score);
+        bestScoreRef.current = next[0].score;
       }
 
       return next;
@@ -458,7 +520,66 @@ export default function App() {
     setCleanedText('');
     setSongResult(null);
     setErrorMessage('');
+    stopPreview().catch(() => {});
   };
+
+  const stopPreview = async () => {
+    if (!previewSound) {
+      return;
+    }
+    try {
+      await previewSound.stopAsync();
+      await previewSound.unloadAsync();
+    } finally {
+      setPreviewSound(null);
+      setIsPreviewPlaying(false);
+    }
+  };
+
+  const togglePreview = async () => {
+    if (!songResult?.previewUrl) {
+      return;
+    }
+    if (isRecording) {
+      setErrorMessage('Đang ghi âm, không thể phát preview.');
+      return;
+    }
+    if (previewSound) {
+      const status = await previewSound.getStatusAsync();
+      if (status.isLoaded && status.isPlaying) {
+        await previewSound.pauseAsync();
+        setIsPreviewPlaying(false);
+        return;
+      }
+      await previewSound.playAsync();
+      setIsPreviewPlaying(true);
+      return;
+    }
+
+    setIsPreviewPlaying(true);
+    const { sound } = await Audio.Sound.createAsync(
+      { uri: songResult.previewUrl },
+      { shouldPlay: true }
+    );
+    sound.setOnPlaybackStatusUpdate((status) => {
+      if (!status.isLoaded) {
+        return;
+      }
+      if (status.didJustFinish) {
+        setIsPreviewPlaying(false);
+      }
+    });
+    setPreviewSound(sound);
+  };
+
+  useEffect(() => {
+    if (!previewSound) {
+      return;
+    }
+    previewSound.unloadAsync().catch(() => {});
+    setPreviewSound(null);
+    setIsPreviewPlaying(false);
+  }, [songResult?.previewUrl]);
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -530,7 +651,7 @@ export default function App() {
 
           {isRecording && (
             <View style={styles.vuWrapper}>
-              <Text style={styles.vuLabel}>Đang lắng nghe</Text>
+              <Text style={styles.vuLabel}>Đang lắng nghe (đoạn {Math.max(chunkCount, 1)})</Text>
               <View style={styles.vuTrack}>
                 <View style={[styles.vuFill, { width: `${Math.round(vuLevel * 100)}%` }]} />
               </View>
@@ -563,6 +684,11 @@ export default function App() {
               <>
                 <Text style={styles.resultTitle}>{songResult.title}</Text>
                 <Text style={styles.resultArtist}>{songResult.artist}</Text>
+                {bestScore > 0 && (
+                  <Text style={styles.resultConfidence}>
+                    Độ tin cậy: {Math.round(bestScore * 100)}%
+                  </Text>
+                )}
                 <Text style={styles.resultSource}>
                   Nguồn nhận diện: {songResult.source === 'audd' ? 'AudD (nhạc)' : 'Genius (lyrics)'}
                 </Text>
@@ -572,6 +698,18 @@ export default function App() {
                 <Text style={styles.resultLink}>
                   Link: {songResult.songUrl || 'Không có'}
                 </Text>
+                {songResult.previewUrl ? (
+                  <Pressable
+                    onPress={togglePreview}
+                    style={[styles.button, styles.previewButton]}
+                  >
+                    <Text style={styles.buttonText}>
+                      {isPreviewPlaying ? 'Dừng nghe thử' : 'Nghe thử 30s'}
+                    </Text>
+                  </Pressable>
+                ) : (
+                  <Text style={styles.mutedText}>Bài này không có preview.</Text>
+                )}
               </>
             ) : (
               <Text style={styles.cardText}>Không tìm thấy bài hát phù hợp.</Text>
@@ -708,6 +846,10 @@ const styles = StyleSheet.create({
   buttonSecondaryText: {
     color: '#E2E8F0',
   },
+  previewButton: {
+    marginTop: 10,
+    backgroundColor: '#38BDF8',
+  },
   loadingRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -735,6 +877,10 @@ const styles = StyleSheet.create({
     color: '#FDBA74',
     marginTop: 4,
     marginBottom: 8,
+  },
+  resultConfidence: {
+    color: '#FBBF24',
+    marginBottom: 6,
   },
   resultSource: {
     color: '#A5B4FC',
